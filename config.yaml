@@ -1,0 +1,26 @@
+server:
+  addr: ":8080"
+
+admin:
+  addr: ":9090"
+
+storage:
+  type: localfs
+  root_dir: ./cache_data
+
+cache:
+  max_items: 1000
+  flush_rule_max_age: 168h
+
+key_rules:
+  include_query_params: []
+  include_headers: []
+
+domains:
+  - domain: "cdn.example.com"
+    origins:
+      - "http://localhost:19876"
+    origin_timeout: 5s
+    origin_retry: 1
+    default_ttl: 1h
+    plugins: []
