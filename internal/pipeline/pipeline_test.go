@@ -1,7 +1,6 @@
 package pipeline_test
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -9,7 +8,7 @@ import (
 	"fileServer/internal/config"
 	"fileServer/internal/pipeline"
 
-	// Import plugins so their init() registers factories.
+	// Import plugins so their init() registers singletons.
 	_ "fileServer/internal/pipeline/header"
 	_ "fileServer/internal/pipeline/ratelimit"
 	_ "fileServer/internal/pipeline/rewrite"
@@ -17,36 +16,27 @@ import (
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func buildPipeline(t *testing.T, cfgs []config.PluginConfig) *pipeline.Pipeline {
-	t.Helper()
-	p, err := pipeline.Build(cfgs)
-	if err != nil {
-		t.Fatalf("Build: %v", err)
-	}
-	return p
-}
-
-func run(p *pipeline.Pipeline, req *http.Request) (int, *pipeline.Ctx) {
+func run(p *pipeline.Pipeline, cfgs []config.PluginConfig, domain string, req *http.Request) (int, *pipeline.PipelineContext) {
 	w := httptest.NewRecorder()
-	pCtx := pipeline.NewPipelineCtx(req.URL.Path)
-	p.Execute(context.Background(), pCtx, w, req)
+	pCtx, _, _ := p.Execute(cfgs, domain, w, req)
 	return w.Code, pCtx
 }
 
 // ── url_rewrite ───────────────────────────────────────────────────────────────
 
 func TestRewriteMatchAndReplace(t *testing.T) {
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "url_rewrite",
 		Config: map[string]any{
 			"rules": []any{
 				map[string]any{"match": `^/v1/(.*)`, "replace": "/api/$1"},
 			},
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/users", nil)
-	_, pCtx := run(p, req)
+	_, pCtx := run(p, cfgs, "cdn.example.com", req)
 
 	if pCtx.RewrittenPath != "/api/users" {
 		t.Errorf("expected /api/users, got %s", pCtx.RewrittenPath)
@@ -54,17 +44,18 @@ func TestRewriteMatchAndReplace(t *testing.T) {
 }
 
 func TestRewriteNoMatch(t *testing.T) {
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "url_rewrite",
 		Config: map[string]any{
 			"rules": []any{
 				map[string]any{"match": `^/v1/(.*)`, "replace": "/api/$1"},
 			},
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/other/path", nil)
-	_, pCtx := run(p, req)
+	_, pCtx := run(p, cfgs, "cdn.example.com", req)
 
 	if pCtx.RewrittenPath != "/other/path" {
 		t.Errorf("expected path unchanged, got %s", pCtx.RewrittenPath)
@@ -74,17 +65,18 @@ func TestRewriteNoMatch(t *testing.T) {
 // ── header ────────────────────────────────────────────────────────────────────
 
 func TestHeaderSetRequest(t *testing.T) {
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "header",
 		Config: map[string]any{
 			"request": []any{
 				map[string]any{"op": "set", "key": "X-Custom", "value": "hello"},
 			},
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, _ = run(p, req)
+	_, _ = run(p, cfgs, "cdn.example.com", req)
 
 	if req.Header.Get("X-Custom") != "hello" {
 		t.Errorf("expected X-Custom: hello, got %q", req.Header.Get("X-Custom"))
@@ -92,18 +84,19 @@ func TestHeaderSetRequest(t *testing.T) {
 }
 
 func TestHeaderDelRequest(t *testing.T) {
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "header",
 		Config: map[string]any{
 			"request": []any{
 				map[string]any{"op": "del", "key": "X-Secret"},
 			},
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Secret", "sensitive")
-	_, _ = run(p, req)
+	_, _ = run(p, cfgs, "cdn.example.com", req)
 
 	if req.Header.Get("X-Secret") != "" {
 		t.Errorf("expected X-Secret to be deleted")
@@ -111,7 +104,8 @@ func TestHeaderDelRequest(t *testing.T) {
 }
 
 func TestHeaderStageResponseSet(t *testing.T) {
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "header",
 		Config: map[string]any{
 			"response": []any{
@@ -119,10 +113,10 @@ func TestHeaderStageResponseSet(t *testing.T) {
 				map[string]any{"op": "del", "key": "Server"},
 			},
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	_, pCtx := run(p, req)
+	_, pCtx := run(p, cfgs, "cdn.example.com", req)
 
 	if pCtx.SetResponseHeaders.Get("X-Cache-Node") != "node-01" {
 		t.Errorf("expected X-Cache-Node staged, got %q", pCtx.SetResponseHeaders.Get("X-Cache-Node"))
@@ -133,7 +127,10 @@ func TestHeaderStageResponseSet(t *testing.T) {
 }
 
 func TestApplyResponseMutations(t *testing.T) {
-	pCtx := pipeline.NewPipelineCtx("/")
+	pCtx := &pipeline.PipelineContext{
+		RewrittenPath:      "/",
+		SetResponseHeaders: make(http.Header),
+	}
 	pCtx.SetResponseHeaders.Set("X-Node", "n1")
 	pCtx.DeleteResponseHeaders = append(pCtx.DeleteResponseHeaders, "Server")
 
@@ -153,45 +150,47 @@ func TestApplyResponseMutations(t *testing.T) {
 // ── rate_limit ────────────────────────────────────────────────────────────────
 
 func TestRateLimitAllows(t *testing.T) {
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "rate_limit",
 		Config: map[string]any{
 			"mode": "domain", "algorithm": "token_bucket",
 			"rate": float64(100), "burst": 100,
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "cdn.example.com"
 	w := httptest.NewRecorder()
-	pCtx := pipeline.NewPipelineCtx("/")
 
-	if !p.Execute(context.Background(), pCtx, w, req) {
+	_, _, ok := p.Execute(cfgs, "cdn.example.com", w, req)
+	if !ok {
 		t.Errorf("expected first request to be allowed, got %d", w.Code)
 	}
 }
 
 func TestRateLimitBlocks(t *testing.T) {
 	// Rate=1/s, burst=1 → second immediate request should be blocked.
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "rate_limit",
 		Config: map[string]any{
 			"mode": "domain", "algorithm": "token_bucket",
 			"rate": float64(1), "burst": 1,
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.Host = "test.example.com"
+	req.Host = "test-block.example.com"
 
 	// First request: allowed.
 	w1 := httptest.NewRecorder()
-	p.Execute(context.Background(), pipeline.NewPipelineCtx("/"), w1, req)
+	p.Execute(cfgs, "test-block.example.com", w1, req)
 
 	// Second request immediately: should be blocked.
 	w2 := httptest.NewRecorder()
-	allowed := p.Execute(context.Background(), pipeline.NewPipelineCtx("/"), w2, req)
-	if allowed {
+	_, _, ok := p.Execute(cfgs, "test-block.example.com", w2, req)
+	if ok {
 		t.Error("expected second request to be rate-limited")
 	}
 	if w2.Code != http.StatusTooManyRequests {
@@ -200,13 +199,14 @@ func TestRateLimitBlocks(t *testing.T) {
 }
 
 func TestSlidingWindowRateLimit(t *testing.T) {
-	p := buildPipeline(t, []config.PluginConfig{{
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{
 		Type: "rate_limit",
 		Config: map[string]any{
 			"mode": "domain", "algorithm": "sliding_window",
 			"rate": float64(2), "burst": 2,
 		},
-	}})
+	}}
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Host = "slide.example.com"
@@ -214,7 +214,8 @@ func TestSlidingWindowRateLimit(t *testing.T) {
 	blocked := 0
 	for range 5 {
 		w := httptest.NewRecorder()
-		if !p.Execute(context.Background(), pipeline.NewPipelineCtx("/"), w, req) {
+		_, _, ok := p.Execute(cfgs, "slide.example.com", w, req)
+		if !ok {
 			blocked++
 		}
 	}
@@ -225,9 +226,16 @@ func TestSlidingWindowRateLimit(t *testing.T) {
 
 // ── unknown plugin ────────────────────────────────────────────────────────────
 
-func TestUnknownPluginReturnsError(t *testing.T) {
-	_, err := pipeline.Build([]config.PluginConfig{{Type: "nonexistent"}})
-	if err == nil {
-		t.Error("expected error for unknown plugin type")
+// In the new design, unknown plugin types are silently skipped so the request
+// continues through the pipeline. This tests that behaviour.
+func TestUnknownPluginIsSkipped(t *testing.T) {
+	p := pipeline.New()
+	cfgs := []config.PluginConfig{{Type: "nonexistent"}}
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	_, _, ok := p.Execute(cfgs, "cdn.example.com", w, req)
+	if !ok {
+		t.Error("expected unknown plugin to be skipped (pipeline should continue)")
 	}
 }

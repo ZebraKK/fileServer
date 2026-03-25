@@ -1,11 +1,13 @@
 // Package ratelimit provides a rate-limiting pipeline plugin.
 // It supports two modes (domain-wide or per-client-IP) and two algorithms
 // (token bucket via golang.org/x/time/rate, and a sliding window).
+//
+// The plugin is a singleton: one instance is registered globally and handles
+// all domains. Per-domain (and per-IP) state is maintained internally via a
+// sync.Map keyed by domain name.
 package ratelimit
 
 import (
-	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"sync"
@@ -18,72 +20,72 @@ import (
 )
 
 func init() {
-	pipeline.RegisterFactory("rate_limit", func(cfg map[string]any) (pipeline.Plugin, error) {
-		return fromConfig(cfg)
-	})
+	pipeline.RegisterPlugin("rate_limit", &Plugin{})
 }
 
-// Plugin enforces rate limits on incoming requests.
+// Plugin is the singleton rate-limit plugin.
+// It manages per-domain limiter state internally.
 type Plugin struct {
-	mode      string // "domain" | "ip"
-	algorithm string // "token_bucket" | "sliding_window"
+	domains sync.Map // domainKey → *perDomainState
+}
+
+// perDomainState holds the limiter map and config for one domain.
+type perDomainState struct {
+	mode       string
+	algorithm  string
 	ratePerSec float64
 	burst      int
 
-	mu       sync.Mutex
-	limiters map[string]limiter
-	lastSeen map[string]time.Time
+	mu          sync.Mutex
+	limiters    map[string]limiter
+	lastSeen    map[string]time.Time
+	cleanupOnce sync.Once
 }
 
 type limiter interface {
 	Allow() bool
 }
 
-// fromConfig parses the map[string]any config block produced by the YAML loader.
-func fromConfig(cfg map[string]any) (*Plugin, error) {
-	mode, _ := cfg["mode"].(string)
-	if mode == "" {
-		mode = "domain"
-	}
-	algo, _ := cfg["algorithm"].(string)
-	if algo == "" {
-		algo = "token_bucket"
-	}
-
+func (p *Plugin) Execute(
+	pCtx *pipeline.PipelineContext,
+	cfg map[string]any,
+	domain string,
+	w http.ResponseWriter,
+	r *http.Request,
+) bool {
+	mode := stringVal(cfg, "mode", "domain")
+	algo := stringVal(cfg, "algorithm", "token_bucket")
 	rps := floatVal(cfg, "rate", 100)
 	burst := intVal(cfg, "burst", int(rps))
 
-	p := &Plugin{
+	// Load or create per-domain state. If config changed between reloads the old
+	// limiters remain (acceptable; full reset requires process restart).
+	stateI, _ := p.domains.LoadOrStore(domain, &perDomainState{
 		mode:       mode,
 		algorithm:  algo,
 		ratePerSec: rps,
 		burst:      burst,
 		limiters:   make(map[string]limiter),
 		lastSeen:   make(map[string]time.Time),
-	}
+	})
+	state := stateI.(*perDomainState)
 
-	// Start a background goroutine to evict stale per-IP limiters.
+	// Start GC goroutine once per domain for IP mode.
 	if mode == "ip" {
-		go p.cleanup()
+		state.cleanupOnce.Do(func() { go state.cleanup() })
 	}
-	return p, nil
-}
 
-func (p *Plugin) Name() string { return "rate_limit" }
+	key := state.limiterKey(r)
 
-func (p *Plugin) Handle(_ context.Context, _ *pipeline.Ctx, w http.ResponseWriter, r *http.Request) bool {
-	key := p.key(r)
-
-	p.mu.Lock()
-	l, ok := p.limiters[key]
+	state.mu.Lock()
+	l, ok := state.limiters[key]
 	if !ok {
-		l = p.newLimiter()
-		p.limiters[key] = l
+		l = state.newLimiter()
+		state.limiters[key] = l
 	}
-	p.lastSeen[key] = time.Now()
+	state.lastSeen[key] = time.Now()
 	allowed := l.Allow()
-	domain := r.Host
-	p.mu.Unlock()
+	state.mu.Unlock()
 
 	result := "pass"
 	if !allowed {
@@ -94,38 +96,38 @@ func (p *Plugin) Handle(_ context.Context, _ *pipeline.Ctx, w http.ResponseWrite
 	return allowed
 }
 
-func (p *Plugin) key(r *http.Request) string {
-	if p.mode == "ip" {
+func (s *perDomainState) limiterKey(r *http.Request) string {
+	if s.mode == "ip" {
 		ip, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			ip = r.RemoteAddr
 		}
 		return ip
 	}
-	return r.Host
+	return "domain"
 }
 
-func (p *Plugin) newLimiter() limiter {
-	if p.algorithm == "sliding_window" {
-		return newSlidingWindow(p.ratePerSec)
+func (s *perDomainState) newLimiter() limiter {
+	if s.algorithm == "sliding_window" {
+		return newSlidingWindow(s.ratePerSec)
 	}
-	return rate.NewLimiter(rate.Limit(p.ratePerSec), p.burst)
+	return rate.NewLimiter(rate.Limit(s.ratePerSec), s.burst)
 }
 
-// cleanup removes limiters for IPs that have been idle for >5 minutes.
-func (p *Plugin) cleanup() {
+// cleanup removes limiters for IPs idle for >5 minutes.
+func (s *perDomainState) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
 		cutoff := time.Now().Add(-5 * time.Minute)
-		p.mu.Lock()
-		for k, t := range p.lastSeen {
+		s.mu.Lock()
+		for k, t := range s.lastSeen {
 			if t.Before(cutoff) {
-				delete(p.limiters, k)
-				delete(p.lastSeen, k)
+				delete(s.limiters, k)
+				delete(s.lastSeen, k)
 			}
 		}
-		p.mu.Unlock()
+		s.mu.Unlock()
 	}
 }
 
@@ -170,6 +172,13 @@ func (sw *slidingWindow) Allow() bool {
 
 // ── config helpers ────────────────────────────────────────────────────────────
 
+func stringVal(cfg map[string]any, key, def string) string {
+	if v, ok := cfg[key].(string); ok && v != "" {
+		return v
+	}
+	return def
+}
+
 func floatVal(cfg map[string]any, key string, def float64) float64 {
 	v, ok := cfg[key]
 	if !ok {
@@ -204,6 +213,3 @@ func intVal(cfg map[string]any, key string, def int) int {
 
 // Ensure Plugin satisfies the interface at compile time.
 var _ pipeline.Plugin = (*Plugin)(nil)
-
-// Ensure fromConfig is reachable for the error return path (linter).
-var _ = fmt.Sprintf

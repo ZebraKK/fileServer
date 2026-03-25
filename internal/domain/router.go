@@ -1,4 +1,4 @@
-// Package domain provides per-domain request handling.
+// Package domain provides unified request handling across all virtual-host domains.
 package domain
 
 import (
@@ -18,71 +18,98 @@ import (
 	"fileServer/internal/origin"
 	"fileServer/internal/pipeline"
 
-	// Side-effect imports register plugin factories.
+	// Side-effect imports register plugin singletons.
 	_ "fileServer/internal/pipeline/header"
 	_ "fileServer/internal/pipeline/ratelimit"
 	_ "fileServer/internal/pipeline/rewrite"
 )
 
-// Deps groups shared infrastructure injected into every domain handler.
+// Deps groups shared infrastructure injected into Handler.
 type Deps struct {
 	Cache      *cache.SingleflightCache
 	FlushStore *flush.Store
 	Puller     *origin.Puller
 	KeyBuilder *cache.KeyBuilder
+	Pipeline   *pipeline.Pipeline
+	Logger     *slog.Logger
 }
 
-// DomainHandler handles all requests for one virtual-host domain.
-type DomainHandler struct {
-	cfg       config.DomainConfig
-	pl        *pipeline.Pipeline
-	deps      Deps
-	rrCounter atomic.Uint64
+// Handler handles all requests using a single unified pipeline.
+// Domain configuration is looked up per-request from an atomically-replaced map.
+type Handler struct {
+	domains    atomic.Pointer[map[string]config.DomainConfig]
+	cache      *cache.SingleflightCache
+	keyBuilder *cache.KeyBuilder
+	flushStore *flush.Store
+	puller     *origin.Puller
+	pipeline   *pipeline.Pipeline
+	logger     *slog.Logger
 }
 
-func newHandler(cfg config.DomainConfig, deps Deps) (*DomainHandler, error) {
-	pl, err := pipeline.Build(cfg.Plugins)
-	if err != nil {
-		return nil, fmt.Errorf("domain %q: build pipeline: %w", cfg.Domain, err)
+// NewHandler creates a Handler from the provided dependencies.
+// Call Update before serving requests.
+func NewHandler(deps Deps) *Handler {
+	h := &Handler{
+		cache:      deps.Cache,
+		keyBuilder: deps.KeyBuilder,
+		flushStore: deps.FlushStore,
+		puller:     deps.Puller,
+		pipeline:   deps.Pipeline,
+		logger:     deps.Logger,
 	}
-	return &DomainHandler{cfg: cfg, pl: pl, deps: deps}, nil
+	empty := make(map[string]config.DomainConfig)
+	h.domains.Store(&empty)
+	return h
 }
 
-func (h *DomainHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	logger := observe.FromContext(ctx)
+// Update atomically replaces the domain configuration map.
+// Safe to call concurrently with ServeHTTP (hot-reload).
+func (h *Handler) Update(domains []config.DomainConfig) {
+	m := make(map[string]config.DomainConfig, len(domains))
+	for _, d := range domains {
+		m[d.Domain] = d
+	}
+	h.domains.Store(&m)
+}
+
+// ServeHTTP implements http.Handler.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// ── 0. Domain lookup ──────────────────────────────────────────────────────
+	host := stripPort(r.Host)
+	m := *h.domains.Load()
+	cfg, ok := m[host]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	logger := observe.FromContext(r.Context())
 	start := time.Now()
 
 	// ── 1. Plugin pipeline ────────────────────────────────────────────────────
-	pCtx := pipeline.NewPipelineCtx(r.URL.Path)
-	if !h.pl.Execute(ctx, pCtx, w, r) {
-		return // plugin short-circuited (e.g. 429)
+	pCtx, r, ok := h.pipeline.Execute(cfg.Plugins, cfg.Domain, w, r)
+	if !ok {
+		return // plugin short-circuited (e.g. 429); response already written
 	}
 
 	// ── 2. Cache key ──────────────────────────────────────────────────────────
-	key := h.deps.KeyBuilder.Build(h.cfg.Domain, pCtx.RewrittenPath, r, h.cfg.KeyRules)
+	key := h.keyBuilder.Build(cfg.Domain, pCtx.RewrittenPath, r, cfg.KeyRules)
 
-	// ── 3. FlushRule check ─────────────────────────────────────────────────────
-	// If the cached entry is older than the flush rule, evict it so that
-	// GetOrFetch will call the origin fetch function.
-	if meta, err := h.deps.Cache.Stat(key); err == nil {
-		if rule := h.deps.FlushStore.Match(h.cfg.Domain, pCtx.RewrittenPath); rule != nil {
+	// ── 3. FlushRule check ────────────────────────────────────────────────────
+	if meta, err := h.cache.Stat(key); err == nil {
+		if rule := h.flushStore.Match(cfg.Domain, pCtx.RewrittenPath); rule != nil {
 			if rule.CreatedAt.After(meta.WrittenAt) {
-				// Lazy flush: evict from LRU index + storage before re-fetching.
-				_ = h.deps.Cache.Delete(key)
+				_ = h.cache.Delete(key)
 				logger.Info("flush rule applied, evicting cache entry", slog.String("key", key))
 			}
 		}
 	}
 
 	// ── 4. Serve (cache hit or origin pull via singleflight) ──────────────────
-	cacheHit := false
+	_, peekErr := h.cache.Stat(key)
+	cacheHit := (peekErr == nil)
 
-	// Peek at meta before GetOrFetch to detect cache hit after possible eviction.
-	_, peekErr := h.deps.Cache.Stat(key)
-	cacheHit = (peekErr == nil)
-
-	rc, meta, err := h.deps.Cache.GetOrFetch(key, h.originFetch(ctx, r, key, logger))
+	rc, meta, err := h.cache.GetOrFetch(key, h.originFetch(cfg, pCtx, r, key))
 	if err != nil {
 		logger.Error("serve failed", slog.String("error", err.Error()), slog.String("key", key))
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
@@ -101,17 +128,16 @@ func (h *DomainHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if cacheHit {
 		w.Header().Set("X-Cache", "hit")
-		observe.CacheHitsTotal.WithLabelValues(h.cfg.Domain).Inc()
+		observe.CacheHitsTotal.WithLabelValues(cfg.Domain).Inc()
 	} else {
 		w.Header().Set("X-Cache", "miss")
-		observe.CacheMissesTotal.WithLabelValues(h.cfg.Domain).Inc()
+		observe.CacheMissesTotal.WithLabelValues(cfg.Domain).Inc()
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, rc)
 
 	latency := time.Since(start)
-	observe.RequestDuration.WithLabelValues(h.cfg.Domain, fmt.Sprintf("%v", cacheHit)).Observe(latency.Seconds())
-
+	observe.RequestDuration.WithLabelValues(cfg.Domain, fmt.Sprintf("%v", cacheHit)).Observe(latency.Seconds())
 	logger.Info("served",
 		slog.String("key", key),
 		slog.Bool("cache_hit", cacheHit),
@@ -119,28 +145,31 @@ func (h *DomainHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// originFetch returns the fetch closure passed to SingleflightCache.GetOrFetch.
-func (h *DomainHandler) originFetch(ctx context.Context, r *http.Request, key string, logger *slog.Logger) func() (io.Reader, *cache.Meta, error) {
+// originFetch returns the fetch closure for SingleflightCache.GetOrFetch.
+func (h *Handler) originFetch(
+	cfg config.DomainConfig,
+	pCtx *pipeline.PipelineContext,
+	r *http.Request,
+	key string,
+) func() (io.Reader, *cache.Meta, error) {
+	// Capture path + query now so the closure doesn't hold a *http.Request reference.
+	path := pCtx.RewrittenPath
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+	header := r.Header.Clone()
+
 	return func() (io.Reader, *cache.Meta, error) {
-		// Use an independent context for the origin pull: the fetch may be shared
-		// across multiple request goroutines via singleflight, and we must not cancel
-		// the pull when any one client closes its connection.
-		// Timeout is enforced by OriginTimeout via the puller, so Background is safe.
-		fetchCtx, cancel := context.WithTimeout(context.Background(), h.cfg.OriginTimeout*time.Duration(h.cfg.OriginRetry+2))
+		// Use an independent context so that a singleflight-shared pull is not
+		// cancelled when any one client closes its connection.
+		fetchCtx, cancel := context.WithTimeout(
+			context.Background(),
+			cfg.OriginTimeout*time.Duration(cfg.OriginRetry+2),
+		)
 		defer cancel()
 
-		// Clone the request using the independent context.
-		outReq := r.Clone(fetchCtx)
-		outReq.URL.Path = r.URL.Path
-
 		pullStart := time.Now()
-		originURL := ""
-		if len(h.cfg.Origins) > 0 {
-			idx := int(h.rrCounter.Load()) % len(h.cfg.Origins)
-			originURL = h.cfg.Origins[idx]
-		}
-
-		resp, err := h.deps.Puller.Pull(ctx, h.cfg.Origins, &h.rrCounter, outReq, h.cfg.OriginTimeout, h.cfg.OriginRetry)
+		resp, err := h.puller.Pull(fetchCtx, cfg.Origins, cfg.OriginTimeout, cfg.OriginRetry, path, header)
 		if err != nil {
 			return nil, nil, fmt.Errorf("origin pull: %w", err)
 		}
@@ -151,7 +180,7 @@ func (h *DomainHandler) originFetch(ctx context.Context, r *http.Request, key st
 			return nil, nil, fmt.Errorf("read origin body: %w", err)
 		}
 
-		ttl := cache.ParseTTL(resp, h.cfg.DefaultTTL)
+		ttl := cache.ParseTTL(resp, cfg.DefaultTTL)
 		meta := &cache.Meta{
 			Key:       key,
 			WrittenAt: time.Now(),
@@ -161,57 +190,15 @@ func (h *DomainHandler) originFetch(ctx context.Context, r *http.Request, key st
 		}
 
 		observe.OriginPullsTotal.WithLabelValues(
-			h.cfg.Domain, originURL, fmt.Sprintf("%d", resp.StatusCode),
+			cfg.Domain, "", fmt.Sprintf("%d", resp.StatusCode),
 		).Inc()
-		observe.OriginPullDuration.WithLabelValues(h.cfg.Domain).Observe(
+		observe.OriginPullDuration.WithLabelValues(cfg.Domain).Observe(
 			time.Since(pullStart).Seconds(),
 		)
-		logger.Info("origin pull", slog.String("origin", originURL), slog.String("key", key))
+		h.logger.Info("origin pull", slog.String("key", key))
 
 		return bytes.NewReader(body), meta, nil
 	}
-}
-
-// ── DomainRouter ──────────────────────────────────────────────────────────────
-
-// DomainRouter dispatches HTTP requests to per-domain handlers.
-// The handler map is replaced atomically on hot-reload.
-type DomainRouter struct {
-	handlers atomic.Pointer[map[string]*DomainHandler]
-}
-
-// New creates an empty DomainRouter. Call Update before serving requests.
-func New() *DomainRouter {
-	r := &DomainRouter{}
-	empty := make(map[string]*DomainHandler)
-	r.handlers.Store(&empty)
-	return r
-}
-
-// Update atomically replaces all domain handlers.
-func (r *DomainRouter) Update(cfgs []config.DomainConfig, deps Deps) error {
-	m := make(map[string]*DomainHandler, len(cfgs))
-	for _, cfg := range cfgs {
-		h, err := newHandler(cfg, deps)
-		if err != nil {
-			return err
-		}
-		m[cfg.Domain] = h
-	}
-	r.handlers.Store(&m)
-	return nil
-}
-
-// ServeHTTP implements http.Handler.
-func (r *DomainRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	host := stripPort(req.Host)
-	m := *r.handlers.Load()
-	h, ok := m[host]
-	if !ok {
-		http.NotFound(w, req)
-		return
-	}
-	h.ServeHTTP(w, req)
 }
 
 func stripPort(host string) string {

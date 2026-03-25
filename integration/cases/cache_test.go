@@ -29,8 +29,9 @@ import (
 	"fileServer/internal/domain"
 	"fileServer/internal/flush"
 	"fileServer/internal/origin"
+	"fileServer/internal/pipeline"
 
-	// Register plugin factories.
+	// Register plugin singletons.
 	_ "fileServer/internal/pipeline/header"
 	_ "fileServer/internal/pipeline/ratelimit"
 	_ "fileServer/internal/pipeline/rewrite"
@@ -100,22 +101,20 @@ func newHarness(t *testing.T, domainName string, originURL string, extraPlugins 
 	lru := cache.NewLRUCache(cfg.Cache.MaxItems, mem)
 	sfCache := cache.NewSingleflightCache(lru)
 	kb := cache.NewKeyBuilder(cfg.KeyRules)
-	puller := origin.New()
 
-	deps := domain.Deps{
+	handler := domain.NewHandler(domain.Deps{
 		Cache:      sfCache,
 		FlushStore: flushStore,
-		Puller:     puller,
+		Puller:     origin.New(),
 		KeyBuilder: kb,
-	}
-	router := domain.New()
-	if err := router.Update(cfg.Domains, deps); err != nil {
-		t.Fatalf("router.Update: %v", err)
-	}
+		Pipeline:   pipeline.New(),
+		Logger:     noopLogger(),
+	})
+	handler.Update(cfg.Domains)
 
 	adminHandler := admin.New(sfCache, flushStore, kb, cfg)
 
-	biz, adm := buildTestHandlers(cfg, router, adminHandler)
+	biz, adm := buildTestHandlers(cfg, handler, adminHandler)
 	bizSrv := httptest.NewServer(biz)
 	adminSrv := httptest.NewServer(adm)
 
@@ -162,9 +161,9 @@ func readBody(t *testing.T, resp *http.Response) string {
 
 // ── server wiring helpers ─────────────────────────────────────────────────────
 
-func buildTestHandlers(cfg *config.Config, router *domain.DomainRouter, adminHandler *admin.Handler) (biz, adm http.Handler) {
+func buildTestHandlers(_ *config.Config, handler *domain.Handler, adminHandler *admin.Handler) (biz, adm http.Handler) {
 	bizMux := http.NewServeMux()
-	bizMux.Handle("/", router)
+	bizMux.Handle("/", handler)
 
 	admMux := http.NewServeMux()
 	admMux.Handle("/metrics", http.NotFoundHandler()) // no Prometheus in tests

@@ -11,12 +11,14 @@ import (
 
 // Puller fetches resources from a list of origin servers using round-robin
 // selection with per-request timeout and automatic retry on failure.
+// Puller is stateless with respect to domain configuration; all parameters
+// are passed per call.
 type Puller struct {
-	client *http.Client
+	client  *http.Client
+	counter atomic.Uint64 // shared round-robin counter across all domains
 }
 
 // New creates a Puller with a shared HTTP client.
-// The client uses no timeout by itself; callers pass timeout via context.
 func New() *Puller {
 	return &Puller{
 		client: &http.Client{
@@ -28,59 +30,56 @@ func New() *Puller {
 	}
 }
 
-// Pull fetches the resource described by req from one of the provided origins.
+// Pull fetches the resource at path from one of the provided origins.
 //
 //   - origins must be non-empty.
-//   - counter is a per-domain atomic counter used for round-robin; the caller
-//     owns it so that the state persists across requests for the same domain.
 //   - timeout is applied per individual attempt.
-//   - maxRetry controls how many additional origins are tried on failure (0 = no retry).
+//   - retry controls how many additional origins are tried on failure (0 = no retry).
+//   - path is the request URI to fetch (may include query string).
+//   - header contains request headers to forward (hop-by-hop headers are filtered).
 //
 // On success the caller is responsible for closing resp.Body.
 func (p *Puller) Pull(
 	ctx context.Context,
 	origins []string,
-	counter *atomic.Uint64,
-	req *http.Request,
 	timeout time.Duration,
-	maxRetry int,
+	retry int,
+	path string,
+	header http.Header,
 ) (*http.Response, error) {
 	if len(origins) == 0 {
 		return nil, fmt.Errorf("origin: no origins configured")
 	}
 
 	n := len(origins)
-	start := int(counter.Add(1)-1) % n
+	start := int(p.counter.Add(1)-1) % n
 
 	var lastErr error
-	for attempt := 0; attempt <= maxRetry; attempt++ {
+	for attempt := 0; attempt <= retry; attempt++ {
 		idx := (start + attempt) % n
-		origin := origins[idx]
-
-		resp, err := p.do(ctx, origin, req, timeout)
+		resp, err := p.do(ctx, origins[idx], path, header, timeout)
 		if err == nil {
 			return resp, nil
 		}
-		lastErr = fmt.Errorf("origin %s: %w", origin, err)
+		lastErr = fmt.Errorf("origin %s: %w", origins[idx], err)
 	}
 	return nil, fmt.Errorf("origin: all attempts failed: %w", lastErr)
 }
 
-// do performs a single HTTP request against originBase.
-func (p *Puller) do(ctx context.Context, originBase string, orig *http.Request, timeout time.Duration) (*http.Response, error) {
+// do performs a single HTTP GET against originBase+path.
+func (p *Puller) do(ctx context.Context, originBase, path string, header http.Header, timeout time.Duration) (*http.Response, error) {
 	tCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Build the outbound URL: origin base + original path + query.
-	target := originBase + orig.URL.RequestURI()
+	target := originBase + path
 
-	outReq, err := http.NewRequestWithContext(tCtx, orig.Method, target, nil)
+	outReq, err := http.NewRequestWithContext(tCtx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 
 	// Copy safe request headers, skipping hop-by-hop headers.
-	copyHeaders(outReq.Header, orig.Header)
+	copyHeaders(outReq.Header, header)
 
 	resp, err := p.client.Do(outReq)
 	if err != nil {

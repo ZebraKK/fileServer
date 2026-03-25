@@ -24,11 +24,9 @@ func TestPullRoundRobin(t *testing.T) {
 	}
 
 	p := New()
-	req, _ := http.NewRequest(http.MethodGet, "/test", nil)
-	var counter atomic.Uint64
 
 	for range 6 {
-		resp, err := p.Pull(context.Background(), origins, &counter, req, 5*time.Second, 0)
+		resp, err := p.Pull(context.Background(), origins, 5*time.Second, 0, "/test", nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -54,11 +52,9 @@ func TestPullRetryOnFailure(t *testing.T) {
 	defer bad.Close()
 
 	p := New()
-	req, _ := http.NewRequest(http.MethodGet, "/", nil)
-	var counter atomic.Uint64
 
 	// bad is first in list; should retry and succeed on good.
-	resp, err := p.Pull(context.Background(), []string{bad.URL, good.URL}, &counter, req, 5*time.Second, 1)
+	resp, err := p.Pull(context.Background(), []string{bad.URL, good.URL}, 5*time.Second, 1, "/", nil)
 	if err != nil {
 		t.Fatalf("expected success after retry, got: %v", err)
 	}
@@ -73,10 +69,8 @@ func TestPullTimeout(t *testing.T) {
 	defer slow.Close()
 
 	p := New()
-	req, _ := http.NewRequest(http.MethodGet, "/", nil)
-	var counter atomic.Uint64
 
-	_, err := p.Pull(context.Background(), []string{slow.URL}, &counter, req, 50*time.Millisecond, 0)
+	_, err := p.Pull(context.Background(), []string{slow.URL}, 50*time.Millisecond, 0, "/", nil)
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
@@ -84,9 +78,7 @@ func TestPullTimeout(t *testing.T) {
 
 func TestPullNoOrigins(t *testing.T) {
 	p := New()
-	req, _ := http.NewRequest(http.MethodGet, "/", nil)
-	var counter atomic.Uint64
-	_, err := p.Pull(context.Background(), nil, &counter, req, time.Second, 0)
+	_, err := p.Pull(context.Background(), nil, time.Second, 0, "/", nil)
 	if err == nil {
 		t.Fatal("expected error for empty origins")
 	}

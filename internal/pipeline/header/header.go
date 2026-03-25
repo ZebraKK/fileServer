@@ -1,10 +1,12 @@
 // Package header provides a request/response header manipulation plugin.
 // Supported operations: set, add, del — applied to request headers immediately
 // and to response headers staged in pCtx for the domain handler to apply.
+//
+// The plugin is a singleton: config (ops) is parsed from the cfg parameter
+// on each Execute call, enabling per-domain header rules without pre-compilation.
 package header
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -14,9 +16,7 @@ import (
 )
 
 func init() {
-	pipeline.RegisterFactory("header", func(cfg map[string]any) (pipeline.Plugin, error) {
-		return fromConfig(cfg)
-	})
+	pipeline.RegisterPlugin("header", &Plugin{})
 }
 
 type headerOp struct {
@@ -25,22 +25,36 @@ type headerOp struct {
 	value string
 }
 
-// Plugin applies header rules to requests and stages response header mutations.
-type Plugin struct {
-	requestOps  []headerOp
-	responseOps []headerOp
-}
+// Plugin is the singleton header plugin. It is stateless.
+type Plugin struct{}
 
-func fromConfig(cfg map[string]any) (*Plugin, error) {
-	p := &Plugin{}
-	var err error
-	if p.requestOps, err = parseOps(cfg, "request"); err != nil {
-		return nil, err
+func (p *Plugin) Execute(
+	pCtx *pipeline.PipelineContext,
+	cfg map[string]any,
+	domain string,
+	_ http.ResponseWriter,
+	r *http.Request,
+) bool {
+	requestOps, _ := parseOps(cfg, "request")
+	responseOps, _ := parseOps(cfg, "response")
+
+	// Request headers: apply immediately.
+	for _, op := range requestOps {
+		applyOp(r.Header, op)
 	}
-	if p.responseOps, err = parseOps(cfg, "response"); err != nil {
-		return nil, err
+
+	// Response headers: stage in pCtx — the domain handler applies them later.
+	for _, op := range responseOps {
+		switch op.op {
+		case "set", "add":
+			pCtx.SetResponseHeaders.Set(op.key, op.value)
+		case "del":
+			pCtx.DeleteResponseHeaders = append(pCtx.DeleteResponseHeaders, op.key)
+		}
 	}
-	return p, nil
+
+	observe.PluginTriggeredTotal.WithLabelValues(domain, "header", "pass").Inc()
+	return true
 }
 
 func parseOps(cfg map[string]any, section string) ([]headerOp, error) {
@@ -64,28 +78,6 @@ func parseOps(cfg map[string]any, section string) ([]headerOp, error) {
 		ops = append(ops, headerOp{op: op, key: key, value: value})
 	}
 	return ops, nil
-}
-
-func (p *Plugin) Name() string { return "header" }
-
-func (p *Plugin) Handle(_ context.Context, pCtx *pipeline.Ctx, _ http.ResponseWriter, r *http.Request) bool {
-	// Request headers: apply immediately.
-	for _, op := range p.requestOps {
-		applyOp(r.Header, op)
-	}
-
-	// Response headers: stage in pCtx — the domain handler applies them later.
-	for _, op := range p.responseOps {
-		switch op.op {
-		case "set", "add":
-			pCtx.SetResponseHeaders.Set(op.key, op.value)
-		case "del":
-			pCtx.DeleteResponseHeaders = append(pCtx.DeleteResponseHeaders, op.key)
-		}
-	}
-
-	observe.PluginTriggeredTotal.WithLabelValues(r.Host, "header", "pass").Inc()
-	return true
 }
 
 func applyOp(h http.Header, op headerOp) {

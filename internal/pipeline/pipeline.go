@@ -4,15 +4,14 @@ package pipeline
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 
 	"fileServer/internal/config"
 )
 
-// Ctx carries mutable state that plugins can read from and write to.
+// PipelineContext carries mutable state that plugins can read from and write to.
 // It is created fresh for each request.
-type Ctx struct {
+type PipelineContext struct {
 	// RewrittenPath holds the URL path after the url_rewrite plugin runs.
 	// Downstream layers (cache key, origin pull) must use this value.
 	// If no rewrite plugin is active it equals the original r.URL.Path.
@@ -27,72 +26,86 @@ type Ctx struct {
 	DeleteResponseHeaders []string
 }
 
-// Plugin is the interface every middleware plugin must implement.
-type Plugin interface {
-	// Name returns the plugin identifier (used in metrics / logs).
-	Name() string
+// ctxKey is the unexported key used to store PipelineContext in a request context.
+type ctxKey struct{}
 
-	// Handle executes the plugin logic. Return true to continue to the next
-	// plugin, false to short-circuit (the plugin must have already written a
-	// response, e.g. 429 for rate limiting).
-	Handle(ctx context.Context, pCtx *Ctx, w http.ResponseWriter, r *http.Request) bool
+// PipelineCtxFrom retrieves the PipelineContext stored in ctx by Execute.
+// Returns (nil, false) if the context does not contain one.
+func PipelineCtxFrom(ctx context.Context) (*PipelineContext, bool) {
+	v, ok := ctx.Value(ctxKey{}).(*PipelineContext)
+	return v, ok
+}
+
+// Plugin is the interface every middleware plugin must implement.
+// Plugins are registered as singletons and must be safe for concurrent use.
+//
+// Execute runs the plugin logic for a single request.
+//   - pCtx is the shared per-request context; plugins may mutate it.
+//   - cfg is the plugin's raw configuration for the current domain.
+//   - domain is the virtual-host name of the request.
+//   - w is the response writer (plugins that short-circuit must write a response).
+//   - r is the incoming request.
+//
+// Return true to pass to the next plugin, false to short-circuit.
+type Plugin interface {
+	Execute(pCtx *PipelineContext, cfg map[string]any, domain string, w http.ResponseWriter, r *http.Request) bool
+}
+
+// registry maps plugin type names to singleton Plugin instances.
+// Populated by plugin packages via RegisterPlugin in their init() functions.
+var registry = map[string]Plugin{}
+
+// RegisterPlugin registers a singleton plugin for a given type name.
+// Typically called from a plugin package's init().
+func RegisterPlugin(typeName string, p Plugin) {
+	registry[typeName] = p
 }
 
 // Pipeline executes an ordered list of plugins for each request.
+// It holds a reference to the global plugin registry and is safe for concurrent use.
 type Pipeline struct {
-	plugins []Plugin
+	reg map[string]Plugin
 }
 
-// Execute runs each plugin in order. Returns false as soon as any plugin
-// short-circuits (returns false); returns true if all plugins passed.
-func (p *Pipeline) Execute(ctx context.Context, pCtx *Ctx, w http.ResponseWriter, r *http.Request) bool {
-	for _, pl := range p.plugins {
-		if !pl.Handle(ctx, pCtx, w, r) {
-			return false
-		}
-	}
-	return true
+// New creates a Pipeline backed by the global plugin registry.
+func New() *Pipeline {
+	return &Pipeline{reg: registry}
 }
 
-// Factory knows how to instantiate plugins by type name.
-// Each plugin package registers itself via RegisterFactory.
-var factories = map[string]func(cfg map[string]any) (Plugin, error){}
-
-// RegisterFactory registers a constructor for a plugin type. Called from each
-// plugin package's init().
-func RegisterFactory(typeName string, fn func(cfg map[string]any) (Plugin, error)) {
-	factories[typeName] = fn
-}
-
-// Build constructs a Pipeline from a slice of PluginConfig.
-// Returns an error if any plugin type is unknown or misconfigured.
-func Build(cfgs []config.PluginConfig) (*Pipeline, error) {
-	plugins := make([]Plugin, 0, len(cfgs))
-	for _, pc := range cfgs {
-		fn, ok := factories[pc.Type]
-		if !ok {
-			return nil, fmt.Errorf("pipeline: unknown plugin type %q", pc.Type)
-		}
-		pl, err := fn(pc.Config)
-		if err != nil {
-			return nil, fmt.Errorf("pipeline: init plugin %q: %w", pc.Type, err)
-		}
-		plugins = append(plugins, pl)
-	}
-	return &Pipeline{plugins: plugins}, nil
-}
-
-// NewPipelineCtx creates a fresh Ctx for a request, seeding RewrittenPath.
-func NewPipelineCtx(originalPath string) *Ctx {
-	return &Ctx{
-		RewrittenPath:      originalPath,
+// Execute runs the plugin chain described by pluginConfigs.
+//
+// It returns:
+//   - pCtx: the populated PipelineContext (always non-nil).
+//   - r: the request updated with pCtx stored in its context (for cross-layer access).
+//   - ok: false if any plugin short-circuited (the plugin wrote its own response).
+func (p *Pipeline) Execute(
+	pluginConfigs []config.PluginConfig,
+	domain string,
+	w http.ResponseWriter,
+	r *http.Request,
+) (*PipelineContext, *http.Request, bool) {
+	pCtx := &PipelineContext{
+		RewrittenPath:      r.URL.Path,
 		SetResponseHeaders: make(http.Header),
 	}
+	for _, pcfg := range pluginConfigs {
+		pl, ok := p.reg[pcfg.Type]
+		if !ok {
+			// Unknown plugin type: skip silently (misconfiguration is caught at startup).
+			continue
+		}
+		if !pl.Execute(pCtx, pcfg.Config, domain, w, r) {
+			return pCtx, r, false
+		}
+	}
+	// Store pCtx in the request context for cross-layer access (e.g. middleware, sub-handlers).
+	r = r.WithContext(context.WithValue(r.Context(), ctxKey{}, pCtx))
+	return pCtx, r, true
 }
 
 // ApplyResponseMutations writes staged header mutations to w just before the
 // response is sent. Called by the domain handler after executing the pipeline.
-func ApplyResponseMutations(w http.ResponseWriter, pCtx *Ctx) {
+func ApplyResponseMutations(w http.ResponseWriter, pCtx *PipelineContext) {
 	for k, vs := range pCtx.SetResponseHeaders {
 		for _, v := range vs {
 			w.Header().Set(k, v)

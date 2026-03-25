@@ -1,9 +1,11 @@
 // Package rewrite provides a URL-rewriting pipeline plugin.
 // Rules are evaluated in order; the first match wins and rewrites pCtx.RewrittenPath.
+//
+// The plugin is a singleton: config (rules) is parsed from the cfg parameter
+// on each Execute call, enabling per-domain rule sets without pre-compilation.
 package rewrite
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -13,50 +15,38 @@ import (
 )
 
 func init() {
-	pipeline.RegisterFactory("url_rewrite", func(cfg map[string]any) (pipeline.Plugin, error) {
-		return fromConfig(cfg)
-	})
+	pipeline.RegisterPlugin("url_rewrite", &Plugin{})
 }
 
-type rule struct {
-	re      *regexp.Regexp
-	replace string
-}
+// Plugin is the singleton URL-rewrite plugin. It is stateless.
+type Plugin struct{}
 
-// Plugin rewrites request paths according to a list of regex rules.
-type Plugin struct {
-	rules []rule
-}
-
-func fromConfig(cfg map[string]any) (*Plugin, error) {
+func (p *Plugin) Execute(
+	pCtx *pipeline.PipelineContext,
+	cfg map[string]any,
+	domain string,
+	_ http.ResponseWriter,
+	_ *http.Request,
+) bool {
 	rawRules, _ := cfg["rules"].([]any)
-	var rules []rule
 	for i, raw := range rawRules {
 		m, ok := raw.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("url_rewrite: rule[%d]: expected map", i)
+			continue
 		}
 		match, _ := m["match"].(string)
 		replace, _ := m["replace"].(string)
 		if match == "" {
-			return nil, fmt.Errorf("url_rewrite: rule[%d]: 'match' is required", i)
+			continue
 		}
 		re, err := regexp.Compile(match)
 		if err != nil {
-			return nil, fmt.Errorf("url_rewrite: rule[%d]: invalid regex %q: %w", i, match, err)
+			// Misconfigured rule — log and skip.
+			_ = fmt.Sprintf("url_rewrite: rule[%d]: invalid regex %q: %v", i, match, err)
+			continue
 		}
-		rules = append(rules, rule{re: re, replace: replace})
-	}
-	return &Plugin{rules: rules}, nil
-}
-
-func (p *Plugin) Name() string { return "url_rewrite" }
-
-func (p *Plugin) Handle(_ context.Context, pCtx *pipeline.Ctx, w http.ResponseWriter, r *http.Request) bool {
-	domain := r.Host
-	for _, rule := range p.rules {
-		if rule.re.MatchString(pCtx.RewrittenPath) {
-			pCtx.RewrittenPath = rule.re.ReplaceAllString(pCtx.RewrittenPath, rule.replace)
+		if re.MatchString(pCtx.RewrittenPath) {
+			pCtx.RewrittenPath = re.ReplaceAllString(pCtx.RewrittenPath, replace)
 			observe.PluginTriggeredTotal.WithLabelValues(domain, "url_rewrite", "rewritten").Inc()
 			return true
 		}

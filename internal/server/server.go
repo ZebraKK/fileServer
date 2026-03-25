@@ -23,7 +23,7 @@ type Servers struct {
 }
 
 // New constructs both HTTP servers and wires routes.
-func New(cfg *config.Config, router *domain.DomainRouter, adminHandler *admin.Handler, logger *slog.Logger) *Servers {
+func New(cfg *config.Config, handler *domain.Handler, adminHandler *admin.Handler, logger *slog.Logger) *Servers {
 	// ── Business server ───────────────────────────────────────────────────────
 	bizR := chi.NewRouter()
 	bizR.Use(
@@ -31,7 +31,7 @@ func New(cfg *config.Config, router *domain.DomainRouter, adminHandler *admin.Ha
 		Recovery,
 		RequestLogger,
 	)
-	bizR.Mount("/", router)
+	bizR.Mount("/", handler)
 
 	// ── Admin server ──────────────────────────────────────────────────────────
 	admR := chi.NewRouter()

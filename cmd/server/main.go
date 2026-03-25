@@ -16,6 +16,7 @@ import (
 	"fileServer/internal/flush"
 	"fileServer/internal/observe"
 	"fileServer/internal/origin"
+	"fileServer/internal/pipeline"
 	"fileServer/internal/server"
 	"fileServer/internal/storage"
 )
@@ -64,37 +65,28 @@ func main() {
 	// ── Key builder ───────────────────────────────────────────────────────────
 	keyBuilder := cache.NewKeyBuilder(cfg.KeyRules)
 
-	// ── Origin puller ─────────────────────────────────────────────────────────
-	puller := origin.New()
-
-	// ── Domain router ─────────────────────────────────────────────────────────
-	deps := domain.Deps{
+	// ── Domain handler ────────────────────────────────────────────────────────
+	handler := domain.NewHandler(domain.Deps{
 		Cache:      sfCache,
 		FlushStore: flushStore,
-		Puller:     puller,
+		Puller:     origin.New(),
 		KeyBuilder: keyBuilder,
-	}
-	router := domain.New()
-	if err := router.Update(cfg.Domains, deps); err != nil {
-		logger.Error("domain router init failed", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
+		Pipeline:   pipeline.New(),
+		Logger:     logger,
+	})
+	handler.Update(cfg.Domains)
 
 	// ── Admin handler ─────────────────────────────────────────────────────────
 	adminHandler := admin.New(sfCache, flushStore, keyBuilder, cfg)
 
 	// ── HTTP servers ──────────────────────────────────────────────────────────
-	srvs := server.New(cfg, router, adminHandler, logger)
+	srvs := server.New(cfg, handler, adminHandler, logger)
 	srvs.Start()
 
 	// ── Config hot-reload ─────────────────────────────────────────────────────
 	go func() {
 		if err := config.Watch(*cfgPath, logger, func(newCfg *config.Config) {
-			if err := router.Update(newCfg.Domains, deps); err != nil {
-				logger.Error("hot-reload: domain router update failed", slog.String("error", err.Error()))
-				return
-			}
-			// Update flush rule cleanup schedule on reload.
+			handler.Update(newCfg.Domains)
 			_ = flushStore.Cleanup(newCfg.Cache.FlushRuleMaxAge)
 			logger.Info("hot-reload complete", slog.Int("domains", len(newCfg.Domains)))
 		}); err != nil {
