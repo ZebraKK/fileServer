@@ -1,0 +1,94 @@
+# CDN Cache Service — example configuration
+# Copy to config.yaml and adjust values before running.
+
+# ── Business server ────────────────────────────────────────────────────────────
+server:
+  addr: ":8080"            # address to listen for cache-serving requests
+
+# ── Admin / metrics server ─────────────────────────────────────────────────────
+admin:
+  addr: ":9090"            # /metrics  /healthz  /admin/*
+
+# ── Storage backend ───────────────────────────────────────────────────────────
+storage:
+  type: localfs            # only "localfs" is supported
+  root_dir: ./cache_data   # directory where cached files are stored
+
+# ── In-memory LRU index ───────────────────────────────────────────────────────
+cache:
+  max_items: 10000                 # maximum entries kept in the LRU index
+  flush_rule_max_age: 168h         # flush rules older than this are discarded (7 days)
+
+# ── Global cache-key rules (overridable per domain) ───────────────────────────
+key_rules:
+  include_query_params: []         # e.g. ["version", "lang"] — empty means ignore all params
+  include_headers: []              # e.g. ["Accept-Language"] — hashed into the key
+
+# ── Virtual-host domains ──────────────────────────────────────────────────────
+domains:
+
+  # Example 1: simple pass-through with rate limiting
+  - domain: "cdn.example.com"
+    origins:
+      - "http://origin1.internal:8000"
+      - "http://origin2.internal:8000"   # round-robin
+    origin_timeout: 10s
+    origin_retry: 1                      # retry once on failure
+    default_ttl: 1h                      # fallback TTL when Cache-Control is absent
+
+    # Per-domain key rules (override global)
+    key_rules:
+      include_query_params: ["v"]
+      include_headers: []
+
+    plugins:
+      - name: ratelimit
+        config:
+          mode: domain                   # "domain" or "ip"
+          algorithm: token_bucket        # "token_bucket" or "sliding_window"
+          rate: 1000                     # requests per second (token bucket)
+          burst: 200                     # burst size
+
+  # Example 2: path rewrite + custom response headers
+  - domain: "assets.example.com"
+    origins:
+      - "http://asset-origin.internal:9000"
+    origin_timeout: 5s
+    origin_retry: 0
+    default_ttl: 24h
+
+    plugins:
+      - name: rewrite
+        config:
+          rules:
+            - pattern: "^/static/(.*)$"
+              replacement: "/v2/static/$1"
+
+      - name: header
+        config:
+          rules:
+            - op: set
+              key: "X-Served-By"
+              value: "cdn-cache"
+            - op: set
+              key: "Access-Control-Allow-Origin"
+              value: "*"
+
+  # Example 3: IP-level rate limiting with sliding window
+  - domain: "api-cache.example.com"
+    origins:
+      - "http://api.internal:8080"
+    origin_timeout: 3s
+    origin_retry: 0
+    default_ttl: 30s
+
+    key_rules:
+      include_query_params: ["page", "size"]
+
+    plugins:
+      - name: ratelimit
+        config:
+          mode: ip
+          algorithm: sliding_window
+          window: 1s
+          max_requests: 50
